@@ -4,12 +4,14 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import copy
 import json
 import six
 import unittest2
 import warnings
 
-from coinbase.model import APIObject
+from coinbase.wallet.model import APIObject
+from coinbase.wallet.model import new_api_object
 
 
 # Dummy API key values for use in tests
@@ -27,6 +29,7 @@ simple_data = {
     'bool': False,
     'none': None,
     'list': [1, 2, 3],
+    'resource': 'foo',
     'obj': {
       'str': 'bar1',
       'foo': 'bar',
@@ -41,17 +44,68 @@ simple_data = {
     ],
   }
 
-class TestApiObject(unittest2.TestCase):
-  def test_load_returns_api_object(self):
+class TestNewApiObject(unittest2.TestCase):
+  def test_new_api_object(self):
     api_client = lambda x: x
-    root = APIObject(api_client)
-    obj = root.load(simple_data)
+    obj = new_api_object(api_client, simple_data)
     self.assertIsInstance(obj, APIObject)
+    self.assertIsNone(obj.response)
+    self.assertIsNone(obj.pagination)
+    self.assertIsNone(obj.warnings)
 
-  def test_load_transforms_types_appropriately(self):
+    response = lambda x: x
+    pagination = lambda x: x
+    warnings = lambda x: x
+    obj = new_api_object(
+        api_client, simple_data, response=response, pagination=pagination,
+        warnings=warnings)
+    self.assertIs(obj.response, response)
+    self.assertIs(obj.pagination, pagination)
+    self.assertIs(obj.warnings, warnings)
+
+  def test_new_api_object_uses_cls_if_available(self):
     api_client = lambda x: x
-    root = APIObject(api_client)
-    simple_obj = root.load(simple_data)
+    class Foo(APIObject): pass
+    obj = new_api_object(api_client, simple_data, cls=Foo)
+    self.assertIsInstance(obj, Foo)
+    self.assertNotIsInstance(obj.obj, Foo)
+
+  def test_new_api_object_guesses_based_on_resource_field(self):
+    api_client = lambda x: x
+    class Foo(APIObject): pass
+    import coinbase.wallet.model
+    # Preserve the inital values so that they can be restored after modifying
+    # them for this test; otherwise, the modified versions will persist for
+    # other tests.
+    original = coinbase.wallet.model._resource_to_model
+    coinbase.wallet.model._resource_to_model = {
+        'foo': Foo,
+      }
+    obj = new_api_object(api_client, simple_data)
+    self.assertIsInstance(obj, Foo)
+    coinbase.wallet.model._resource_to_model = original
+
+  def test_new_api_object_guesses_based_on_keys(self):
+    api_client = lambda x: x
+    class Foo(APIObject): pass
+    import coinbase.wallet.model
+    # Preserve the inital values so that they can be restored after modifying
+    # them for this test; otherwise, the modified versions will persist for
+    # other tests.
+    original = coinbase.wallet.model._obj_keys_to_model
+    coinbase.wallet.model._obj_keys_to_model = {
+        frozenset(('str', 'foo')): Foo,
+      }
+    simple_obj = new_api_object(api_client, simple_data)
+    self.assertIsInstance(simple_obj, Foo)
+    self.assertIsInstance(simple_obj['obj'], Foo)
+    for obj in simple_obj['list_of_objs']:
+      self.assertNotIsInstance(obj, Foo)
+    coinbase.wallet.model._obj_keys_to_model = original
+
+  def test_new_api_object_transforms_types_appropriately(self):
+    api_client = lambda x: x
+    simple_obj = new_api_object(api_client, simple_data)
 
     # Check root level for dict -> APIObject transformation.
     self.assertIsInstance(simple_data['obj'], dict)
@@ -63,16 +117,15 @@ class TestApiObject(unittest2.TestCase):
 
     # Check lists for dict -> APIObject transformation
     self.assertIsInstance(simple_data['list_of_objs'], list)
-    assert all(map(lambda obj: isinstance(obj, dict),
-                   simple_data['list_of_objs']))
     self.assertIsInstance(simple_obj['list_of_objs'], list)
-    assert all(map(lambda obj: isinstance(obj, APIObject),
-                   simple_obj['list_of_objs']))
+    for item in simple_data['list_of_objs']:
+      self.assertIsInstance(item, dict)
+    for item in simple_obj['list_of_objs']:
+      self.assertIsInstance(item, APIObject)
 
     # Check that non-dict/list values are left the same.
     self.assertIsInstance(simple_data['str'], six.string_types)
     self.assertIsInstance(simple_obj['str'], six.string_types)
-
     self.assertIsInstance(simple_data['int'], int)
     self.assertIsInstance(simple_obj['int'], int)
     self.assertIsInstance(simple_data['float'], float)
@@ -82,54 +135,19 @@ class TestApiObject(unittest2.TestCase):
     self.assertIsNone(simple_data['none'])
     self.assertIsNone(simple_obj['none'])
 
-  def test_load_preserves_api_client(self):
+  def test_new_api_object_preserves_api_client(self):
     api_client = lambda x: x
-
-    # Check that the property works as expected.
-    root = APIObject(api_client)
-    self.assertIs(root.api_client, api_client)
-
-    # Check that all API objects created by the root have the same API client
-    # as the root.
-    simple_obj = root.load(simple_data)
-    assert simple_obj.api_client is api_client
-    assert simple_obj['obj'].api_client is api_client
-    assert all(map(lambda obj: obj.api_client is api_client,
-                   simple_obj['list_of_objs']))
-
-    # Check that all API objects created by objects created by the root have
-    # the same API client as the root.
-    test_obj = simple_obj.load({'foo': 'bar'})
-    assert test_obj.api_client is api_client
-
-
-  def test_load_preserves_account(self):
-    api_client = lambda x: x
-    account = lambda y: y
-
-    # Check that the property works as expected.
-    root = APIObject(api_client, account=account)
-    assert root.account is account
-
-    # Check that all API objects created by the root have the same account as
-    # the root.
-    simple_obj = root.load(simple_data)
-    assert simple_obj.account is account
-    assert simple_obj['obj'].account is account
-    assert all(map(lambda obj: obj.account is account,
-                   simple_obj['list_of_objs']))
-
-    # Check that all API objects created by objects created by the root have
-    # the same account as the root.
-    test_obj = simple_obj.load({'foo': 'bar'})
-    assert test_obj.account is account
+    simple_obj = new_api_object(api_client, simple_data)
+    # Check that all sub API objects have the same API client as the root.
+    self.assertIs(simple_obj.api_client, api_client)
+    self.assertIs(simple_obj['obj'].api_client, api_client)
+    for thing in simple_obj['list_of_objs']:
+      self.assertIs(thing.api_client, api_client)
 
   def test_attr_access(self):
     api_client = lambda x: x
-    root = APIObject(api_client)
-
     # Every key in the object should be accessible by attribute access.
-    simple_obj = root.load(simple_data)
+    simple_obj = new_api_object(api_client, simple_data)
     for key, value in simple_obj.items():
       assert (key in simple_obj) and hasattr(simple_obj, key)
       assert getattr(simple_obj, key) is simple_obj[key]
@@ -151,17 +169,26 @@ class TestApiObject(unittest2.TestCase):
 
     # Methods on the object should not be accessible via key.
     data = {'foo': 'bar'}
-    data_obj = root.load(data)
-    assert hasattr(data_obj, 'load')
-    assert 'load' not in data_obj
+    data_obj = new_api_object(None, data)
+    assert hasattr(data_obj, 'refresh')
+    assert 'refresh' not in data_obj
     with self.assertRaises(KeyError):
-      data_obj['load']
+      data_obj['refresh']
+
+    # Setting attributes that begin with a '_' are not available via __getitem__
+    data_obj._test = True
+    self.assertEqual(getattr(data_obj, '_test', None), True)
+    self.assertEqual(data_obj.get('_test', None), None)
+
+    # Setting attribuets that don't begin with a '_' are available via __getitem__
+    data_obj.test = True
+    self.assertEqual(getattr(data_obj, 'test', None), True)
+    self.assertEqual(data_obj.get('test', None), True)
 
 
   def test_json_serialization(self):
     api_client = lambda x: x
-    root = APIObject(api_client)
-    simple_obj = root.load(simple_data)
+    simple_obj = new_api_object(api_client, simple_data)
 
     # APIObjects should be equivalent to the dicts from which they were loaded.
     self.assertEqual(simple_obj, simple_data)
@@ -174,66 +201,28 @@ class TestApiObject(unittest2.TestCase):
     self.assertEqual(json_data, json_obj)
 
     # Two APIObjects created from the same data should be equivalent.
-    simple_obj2 = root.load(simple_data)
+    simple_obj2 = new_api_object(api_client, simple_data)
     self.assertEqual(simple_obj, simple_obj2)
 
     # When an object is unserializable, it should still be convertible to a
     # string.
     from decimal import Decimal
-    broken_obj = root.load({'cost': Decimal('12.0')})
+    broken_obj = new_api_object(api_client, {'cost': Decimal('12.0')})
     self.assertTrue(str(broken_obj).endswith('(invalid JSON)'))
 
-
-  def test_paged_key(self):
+  def test_paged_data_value(self):
     api_client = lambda x: x
-    root = APIObject(api_client)
-    simple_obj = root.load(simple_data, paged_key='list_of_objs')
+    # When the 'data' attribute is a list, slicing and indexing the APIObject
+    # looks into the list.
+    data = copy.copy(simple_data)
+    data['data'] = data.pop('list_of_objs')
+    simple_obj = new_api_object(api_client, data)
+    print(simple_obj)
 
-    self.assertEqual(simple_obj[0], simple_obj['list_of_objs'][0])
-    self.assertEqual(simple_obj[::], simple_obj['list_of_objs'])
-    self.assertEqual(simple_obj[::-1], simple_obj['list_of_objs'][::-1])
+    self.assertEqual(simple_obj[0], simple_obj['data'][0])
+    self.assertEqual(simple_obj[::], simple_obj['data'])
+    self.assertEqual(simple_obj[::-1], simple_obj['data'][::-1])
 
-    simple_obj2 = root.load(simple_data, paged_key='key_does_not_exist')
+    simple_obj2 = new_api_object(api_client, simple_data)
     with self.assertRaises(KeyError):
       simple_obj2[0]
-
-    simple_obj3 = root.load(simple_data)
-    with self.assertRaises(KeyError):
-      simple_obj3[0]
-
-  def test_model_lookup(self):
-    import coinbase.model
-    class DummyModel(APIObject): pass
-    api_client = lambda x: x
-    root = APIObject(api_client)
-
-    # Preserve the inital values so that they can be restored after modifying
-    # them for this test; otherwise, the modified versions will persist for
-    # other tests.
-    obj_keys_to_model = coinbase.model._obj_keys_to_model
-    key_to_model = coinbase.model._key_to_model
-
-    # Check to make sure that key lookup works.
-    coinbase.model._obj_keys_to_model = {}
-    coinbase.model._key_to_model = {
-        'obj': DummyModel,
-        'list_of_objs': DummyModel,
-      }
-    simple_obj = root.load(simple_data)
-    self.assertIsInstance(simple_obj['obj'], DummyModel)
-    for obj in simple_obj['list_of_objs']:
-      self.assertIsInstance(obj, DummyModel)
-
-    coinbase.model._key_to_model = {}
-    coinbase.model._obj_keys_to_model = {
-        frozenset(('str', 'foo')): DummyModel,
-      }
-    simple_obj = root.load(simple_data)
-    self.assertIsInstance(simple_obj, DummyModel)
-    self.assertIsInstance(simple_obj['obj'], DummyModel)
-    for obj in simple_obj['list_of_objs']:
-      self.assertNotIsInstance(obj, DummyModel)
-
-    # Restore original values.
-    coinbase.model._obj_keys_to_model = obj_keys_to_model
-    coinbase.model._key_to_model = key_to_model

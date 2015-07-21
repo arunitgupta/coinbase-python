@@ -4,26 +4,26 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import json
-import re
+import six
 import unittest2
 import warnings
 
 import httpretty as hp
 
-from coinbase.client import Client
-from coinbase.client import OAuthClient
-from coinbase.error import APIError
-from coinbase.error import TwoFactorTokenRequired
-from coinbase.error import UnexpectedDataFormatError
-from coinbase.model import APIObject
-from coinbase.model import Account
-from coinbase.model import Address
-from coinbase.model import Button
-from coinbase.model import Money
-from coinbase.model import Order
-from coinbase.model import Transaction
-from coinbase.model import Transfer
+from coinbase.wallet.client import Client
+from coinbase.wallet.model import APIObject
+from coinbase.wallet.model import new_api_object
+from coinbase.wallet.model import Account
+from coinbase.wallet.model import Sell
+from coinbase.wallet.model import CurrentUser
+from coinbase.wallet.model import Deposit
+from coinbase.wallet.model import Checkout
+from coinbase.wallet.model import Order
+from coinbase.wallet.model import Withdrawal
+from coinbase.wallet.model import Buy
+from coinbase.wallet.model import Address
+from coinbase.wallet.model import Transaction
+from tests.helpers import mock_response
 
 
 # Hide all warning output.
@@ -37,1104 +37,520 @@ client_secret = 'fakesecret'
 access_token = 'fakeaccesstoken'
 refresh_token = 'fakerefreshtoken'
 
+mock_item = {'key1': 'val1', 'key2': 'val2'}
+mock_item_updated = {
+    'key1': 'val1-modified',
+    'key2': 'val2-modified',
+    'key3': 'newkey',
+  }
+mock_collection = [mock_item, mock_item]
 
+
+class TestAPIObject(unittest2.TestCase):
+  @mock_response(hp.GET, '/resource/foo', mock_item_updated)
+  def test_refresh(self):
+    client = Client(api_key, api_secret)
+    obj = new_api_object(client, mock_item, APIObject)
+    self.assertEqual(obj, mock_item)
+    # Missing resource_path key results in ValueError
+    with self.assertRaises(ValueError):
+      obj.refresh()
+    obj.resource_path = '/resource/foo'
+    updated = obj.refresh()
+    self.assertEqual(updated, mock_item_updated)
+    # The updated version is returned, as well as being used to update the
+    # object making the refresh()
+    for key, value in six.iteritems(mock_item_updated):
+      self.assertEqual(obj[key], value)
+    # Keys not present originally will not be removed
+    self.assertEqual(obj.resource_path, '/resource/foo')
+
+
+mock_account = {
+    'id': 'foo',
+    'resource_path': '/v2/accounts/foo',
+  }
+mock_account_updated = {
+    'id': 'foo',
+    'resource_path': '/v2/accounts/foo',
+    'newkey': 'present',
+  }
 class TestAccount(unittest2.TestCase):
-  @hp.activate
-  def test_delete(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith(account.id))
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.DELETE, re.compile('.*'), body=server_response)
-    data = {'success': False}
-    with self.assertRaises(APIError):
-      account.delete()
-
-    data = {'success': True}
-    self.assertIsNone(account.delete())
-
-  @hp.activate
+  @mock_response(hp.POST, '/v2/accounts/foo/primary', mock_account_updated)
   def test_set_primary(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    account.primary = None
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    data = account.set_primary()
+    self.assertEqual(data, mock_account_updated)
+    for key, value in six.iteritems(mock_account_updated):
+      self.assertEqual(account[key], value)
 
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith('%s/primary' % account.id))
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-    data = {'success': False}
-    with self.assertRaises(APIError):
-      account.set_primary()
-    self.assertIsNone(account.primary) # Primary status should not have changed.
-
-    data = {'success': True}
-    account.set_primary()
-    self.assertTrue(account.primary) # Primary status should have changed.
-
-  @hp.activate
+  @mock_response(hp.PUT, '/v2/accounts/foo', mock_account_updated)
   def test_modify(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    account.name = initial_name = 'Wallet'
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    data = account.modify(name='New Account Name')
+    self.assertEqual(data, mock_account_updated)
+    for key, value in six.iteritems(mock_account_updated):
+      self.assertEqual(account[key], value)
 
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith(account.id))
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      name = request_data.get('account', {}).get('name')
-      assert name == new_name
-      return (200, headers, json.dumps(data))
+  @mock_response(hp.DELETE, '/v2/accounts/foo', None)
+  def test_delete(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    data = account.delete()
+    self.assertIs(data, None)
 
-    new_name = 'Vault'
-    data = {'success': False, 'account': {'name': new_name}}
-    hp.register_uri(hp.PUT, re.compile('.*'), body=server_response)
-    with self.assertRaises(APIError):
-      account.modify(new_name)
-    self.assertEqual(account.name, initial_name)
-
-    data = {'success': True, 'account': {'name': new_name}}
-    account.modify(new_name)
-    self.assertEqual(account.name, new_name)
-
-    data = {'success': True, 'account': 'nottherighttype'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.modify(new_name)
-
-  @hp.activate
-  def test_get_balance(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    account.balance = initial_balance = lambda: None # Initial value
-
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith('%s/balance' % account.id))
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
-    data = {'currency': 'USD', 'amount': '10.00'}
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-    balance = account.get_balance()
-    self.assertIsInstance(balance, Money)
-    # Fetching the current balance should not modify the balance attribute on
-    # the Account object.
-    self.assertEqual(account.balance, initial_balance)
-
-  @hp.activate
-  def test_get_address(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith('%s/address' % account.id))
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {'address': 'a',
-            'callback_url': None,
-            'label': None,
-            'success': False}
-    with self.assertRaises(APIError):
-      account.get_address()
-
-    data = {'badkey': 'bar',
-            'success': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_address()
-
-    data = {'address': 'a',
-            'callback_url': None,
-            'label': None,
-            'success': True}
-    address = account.get_address()
-    self.assertIsInstance(address, Address)
-
-  @hp.activate
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses', mock_collection)
   def test_get_addresses(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      data = {
-          'total_count': 3,
-          'current_page': 1,
-          'num_pages': 1,
-          'addresses': [
-            {'address': {
-              'label': '',
-              'address': 'foo',
-              'callback_url': '',
-              'id': '1'
-            }},
-            {'address': {
-              'label': '',
-              'address': 'foo',
-              'callback_url': '',
-              'id': '2'
-            }},
-            {'address': {
-              'label': '',
-              'address': 'foo',
-              'callback_url': '',
-              'id': '3'
-            }},
-          ],
-        }
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-    response = account.get_addresses()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.addresses), 3)
-    for address in response.addresses:
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    addresses = account.get_addresses()
+    self.assertIsInstance(addresses, APIObject)
+    self.assertEqual(addresses.data, mock_collection)
+    for address in addresses.data:
       self.assertIsInstance(address, Address)
 
-  @hp.activate
-  def test_create_address(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      address = request_data.get('address')
-      assert isinstance(address, dict)
-      if label is not None:
-        assert address.get('label') == label
-      if callback_url is not None:
-        assert address.get('callback_url') == callback_url
-      return (200, headers, json.dumps(data))
-
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    label, callback_url = ('label', 'http://example.com/')
-    data = {'success': False,
-            'address': 'foo',
-            'label': label,
-            'callback_url': callback_url}
-    with self.assertRaises(APIError):
-     account.create_address(label, callback_url)
-
-    label, callback_url = ('label', 'http://example.com/')
-    data = {'success': True, 'arbkey': 'bar'}
-    with self.assertRaises(UnexpectedDataFormatError):
-     account.create_address(label, callback_url)
-
-    label, callback_url = ('label', 'http://example.com/')
-    data = {'success': True,
-            'address': 'foo',
-            'label': label,
-            'callback_url': callback_url}
-    address = account.create_address(label, callback_url)
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses/bar', mock_item)
+  def test_get_address(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    address = account.get_address('bar')
     self.assertIsInstance(address, Address)
+    self.assertEqual(address, mock_item)
+    pass
 
-    label, callback_url = (None, None)
-    data = {'success': True,
-            'address': 'foo',
-            'label': label,
-            'callback_url': callback_url}
-    address = account.create_address()
-    self.assertIsInstance(address, Address)
-
-  @hp.activate
-  def test_get_transactions(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      data = {
-          'total_count': 3,
-          'current_page': 1,
-          'num_pages': 1,
-          'transactions': [
-            {'transaction': {'id': '1'}},
-            {'transaction': {'id': '2'}},
-            {'transaction': {'id': '3'}},
-          ],
-        }
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-    response = account.get_transactions()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.transactions), 3)
-    for transaction in response.transactions:
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses/bar/transactions', mock_collection)
+  def test_get_address_transactions(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    transactions = account.get_address_transactions('bar')
+    self.assertIsInstance(transactions, APIObject)
+    self.assertEqual(transactions.data, mock_collection)
+    for transaction in transactions.data:
       self.assertIsInstance(transaction, Transaction)
 
-  @hp.activate
-  def test_get_transaction(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-
-    transaction_id = 'faketransactionid'
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {'missing_transaction_key': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_transaction(transaction_id)
-
-    data = {'transaction': 'not-the-right-type'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_transaction(transaction_id)
-
-    data = {'transaction': {'id': '1'}}
-    transaction = account.get_transaction(transaction_id)
-    self.assertIsInstance(transaction, Transaction)
-
-  @hp.activate
-  def test_transfer_money(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    base_kwargs = {
-        'to_account_id': 'fake-account-id',
-        'amount': '12.0 BTC',
-      }
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso=None)
-      account.transfer_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string=None, amount_currency_iso='USD')
-      account.transfer_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso=None)
-      account.transfer_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso='USD')
-      account.transfer_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso='USD')
-      account.transfer_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string='12.0', amount_currency_iso=None)
-      account.transfer_money(**kwargs)
-
-    def server_response(request, uri, headers):
-      try: req = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      tx_data = req.get('transaction')
-      self.assertIsInstance(tx_data, dict)
-      self.assertEqual(len(tx_data), len(kwargs))
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      data = {'success': False, 'transaction': {'id': '1'}}
-      kwargs = base_kwargs.copy()
-      account.transfer_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'transaction': 'wrong-type'}
-      kwargs = base_kwargs.copy()
-      account.transfer_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'missing-transaction-key': True}
-      kwargs = base_kwargs.copy()
-      account.transfer_money(**kwargs)
-
-    data = {'success': True, 'transaction': {'id': '1'}}
-    kwargs = base_kwargs.copy()
-    tx = account.transfer_money(**kwargs)
-    self.assertIsInstance(tx, Transaction)
-
-  @hp.activate
-  def test_send_money(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    base_kwargs = {
-        'to_btc_address': 'some-btc-address',
-        'amount': '12.0 BTC',
-      }
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso=None)
-      account.send_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string=None, amount_currency_iso='USD')
-      account.send_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso=None)
-      account.send_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso='USD')
-      account.send_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso='USD')
-      account.send_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string='12.0', amount_currency_iso=None)
-      account.send_money(**kwargs)
-
-    def server_response(request, uri, headers):
-      try: req = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      tx_data = req.get('transaction')
-      self.assertIsInstance(tx_data, dict)
-      self.assertEqual(len(tx_data), len(kwargs))
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      data = {'success': False, 'transaction': {'id': '1'}}
-      kwargs = base_kwargs.copy()
-      account.send_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'transaction': 'wrong-type'}
-      kwargs = base_kwargs.copy()
-      account.send_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'missing-transaction-key': True}
-      kwargs = base_kwargs.copy()
-      account.send_money(**kwargs)
-
-    data = {'success': True, 'transaction': {'id': '1'}}
-    kwargs = base_kwargs.copy()
-    tx = account.send_money(**kwargs)
-    self.assertIsInstance(tx, Transaction)
-
-    oauth_account = Account(
-        OAuthClient(client_id, client_secret, access_token, refresh_token))
-    oauth_account.id = 'fakeaccountid'
-
-    hp.reset()
-    def server_response(request, uri, headers):
-      try: req = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      tx_data = req.get('transaction')
-      self.assertIsInstance(tx_data, dict)
-      if two_factor_token:
-        self.assertEqual(request.headers.get('CB-2FA-Token'), two_factor_token)
-        self.assertIsNone(tx_data.get('CB-2FA-Token'))
-        return (200, headers, json.dumps(data))
-      return (402, headers, '')
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    kwargs = base_kwargs.copy()
-    kwargs['two_factor_token'] = two_factor_token = None
-    with self.assertRaises(TwoFactorTokenRequired):
-      oauth_account.send_money(**kwargs)
-
-    kwargs['two_factor_token'] = two_factor_token = 'sometoken'
-    tx = oauth_account.send_money(**kwargs)
-    self.assertIsInstance(tx, Transaction)
-
-  @hp.activate
-  def test_request_money(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    base_kwargs = {
-        'from_email_address': 'some-btc-address',
-        'amount': '12.0 BTC',
-      }
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso=None)
-      account.request_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string=None, amount_currency_iso='USD')
-      account.request_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso=None)
-      account.request_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(
-          amount='12.0', amount_string='12.0', amount_currency_iso='USD')
-      account.request_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string=None, amount_currency_iso='USD')
-      account.request_money(**kwargs)
-    with self.assertRaises(ValueError):
-      kwargs = base_kwargs.copy()
-      kwargs.update(amount=None, amount_string='12.0', amount_currency_iso=None)
-      account.request_money(**kwargs)
-
-    def server_response(request, uri, headers):
-      try: req = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      tx_data = req.get('transaction')
-      self.assertIsInstance(tx_data, dict)
-      self.assertEqual(len(tx_data), len(kwargs))
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      data = {'success': False, 'transaction': {'id': '1'}}
-      kwargs = base_kwargs.copy()
-      account.request_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'transaction': 'wrong-type'}
-      kwargs = base_kwargs.copy()
-      account.request_money(**kwargs)
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'missing-transaction-key': True}
-      kwargs = base_kwargs.copy()
-      account.request_money(**kwargs)
-
-    data = {'success': True, 'transaction': {'id': '1'}}
-    kwargs = base_kwargs.copy()
-    tx = account.request_money(**kwargs)
-    self.assertIsInstance(tx, Transaction)
-
-  @hp.activate
-  def test_get_transfers(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {
-        'total_count': 3,
-        'current_page': 1,
-        'num_pages': 1,
-        'transfers': [
-          {'transfer': {'id': '1'}},
-          {'transfer': {'id': '2'}},
-          {'transfer': {'id': '3'}},
-        ],
-      }
-    response = account.get_transfers()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.transfers), 3)
-    for transfer in response.transfers:
-      self.assertIsInstance(transfer, Transfer)
-
-  @hp.activate
-  def test_get_transfer(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-
-    transfer_id = 'faketransferid'
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {'missing_transfer_key': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_transfer(transfer_id)
-
-    data = {'transfer': 'not-the-right-type'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_transfer(transfer_id)
-
-    data = {'transfer': {'id': '1'}}
-    transfer = account.get_transfer(transfer_id)
-    self.assertIsInstance(transfer, Transfer)
-
-  @hp.activate
-  def test_get_button(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    button_code = 'fakebuttoncode'
-
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {'button': 'not-the-right-type'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_button(button_code)
-
-    data = {'missing-button-key': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_button(button_code)
-
-    data = {'button': {'code': button_code}}
-    button = account.get_button(button_code)
-    self.assertIsInstance(button, Button)
-
-    data = {'badkey': 'bar',
-            'success': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_address()
-
-    data = {'address': 'a',
-            'callback_url': None,
-            'label': None,
-            'success': True}
-    address = account.get_address()
+  @mock_response(hp.POST, '/v2/accounts/foo/addresses', mock_item)
+  def test_create_address(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    address = account.create_address()
     self.assertIsInstance(address, Address)
+    self.assertEqual(address, mock_item)
 
-  @hp.activate
-  def test_create_button(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
+  @mock_response(hp.GET, '/v2/accounts/foo/transactions', mock_collection)
+  def test_get_transactions(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    transactions = account.get_transactions()
+    self.assertIsInstance(transactions, APIObject)
+    self.assertEqual(transactions.data, mock_collection)
+    for transaction in transactions.data:
+      self.assertIsInstance(transaction, Transaction)
 
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      button_data = request_data.get('button')
-      self.assertIsInstance(button_data, dict)
-      for key in ['name', 'price_string', 'price_currency_iso']:
-        self.assertTrue(key in button_data)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
+  @mock_response(hp.GET, '/v2/accounts/foo/transactions/bar', mock_item)
+  def test_get_transaction(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    transaction = account.get_transaction('bar')
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
 
-    name = 'b-name'
-    price_string = 'b-price'
-    price_currency_iso = 'BTC'
-    with self.assertRaises(APIError):
-     data = {
-         'success': False,
-         'button': {
-           'name': name,
-           'price_string': price_string,
-           'price_currency_iso': price_currency_iso,
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_send_money(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = account.send_money(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = account.send_money(**send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
 
-         },
-       }
-     account.create_button(name, price_string, price_currency_iso)
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_transfer_money(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = account.transfer_money(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = account.transfer_money(**send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'button': 'wrong-type'}
-     account.create_button(name, price_string, price_currency_iso)
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_request_money(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = account.request_money(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = account.request_money(**send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'missing-button-key': True}
-     account.create_button(name, price_string, price_currency_iso)
+  @mock_response(hp.GET, '/v2/accounts/foo/buys', mock_collection)
+  def test_get_buys(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    buys = account.get_buys()
+    self.assertIsInstance(buys, APIObject)
+    self.assertEqual(buys.data, mock_collection)
+    for buy in buys.data:
+      self.assertIsInstance(buy, Buy)
 
-    data = {
-        'success': True,
-        'button': {
-          'name': name,
-          'price_string': price_string,
-          'price_currency_iso': price_currency_iso,
+  @mock_response(hp.GET, '/v2/accounts/foo/buys/bar', mock_item)
+  def test_get_buy(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    buy = account.get_buy('bar')
+    self.assertIsInstance(buy, Buy)
+    self.assertEqual(buy, mock_item)
 
-        },
-      }
-    button = account.create_button(name, price_string, price_currency_iso)
-    self.assertIsInstance(button, Button)
-
-  @hp.activate
-  def test_get_orders(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {
-        'total_count': 3,
-        'current_page': 1,
-        'num_pages': 1,
-        'orders': [
-          {'order': {'id': '1'}},
-          {'order': {'id': '2'}},
-          {'order': {'id': '3'}},
-        ],
-      }
-    response = account.get_orders()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.orders), 3)
-    for order in response.orders:
-      self.assertIsInstance(order, Order)
-
-  @hp.activate
-  def test_get_order(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-
-    order_id = 'fakeorderid'
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {'missing_order_key': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_order(order_id)
-
-    data = {'order': 'not-the-right-type'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account.get_order(order_id)
-
-    data = {'order': {'id': '1'}}
-    order = account.get_order(order_id)
-    self.assertIsInstance(order, Order)
-
-  @hp.activate
-  def test_create_order(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      button_data = request_data.get('button')
-      self.assertIsInstance(button_data, dict)
-      for key in ['name', 'price_string', 'price_currency_iso']:
-        self.assertTrue(key in button_data)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    name = 'b-name'
-    price_string = 'b-price'
-    price_currency_iso = 'BTC'
-    with self.assertRaises(APIError):
-     data = {
-         'success': False,
-         'order': {
-           'name': name,
-           'price_string': price_string,
-           'price_currency_iso': price_currency_iso,
-
-         },
-       }
-     account.create_order(name, price_string, price_currency_iso)
-
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'order': 'wrong-type'}
-     account.create_order(name, price_string, price_currency_iso)
-
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'missing-order-key': True}
-     account.create_order(name, price_string, price_currency_iso)
-
-    data = {
-        'success': True,
-        'order': {
-          'name': name,
-          'price_string': price_string,
-          'price_currency_iso': price_currency_iso,
-
-        },
-      }
-    order = account.create_order(name, price_string, price_currency_iso)
-    self.assertIsInstance(order, Order)
-
-  @hp.activate
+  @mock_response(hp.POST, '/v2/accounts/foo/buys', mock_item)
   def test_buy(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    with self.assertRaises(ValueError):
+      account.buy()
+    for valid_kwargs in [{'amount': '1.0'}, {'total': '1.0'}]:
+      buy = account.buy(**valid_kwargs)
+      self.assertIsInstance(buy, Buy)
+      self.assertEqual(buy, mock_item)
 
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      self.assertEqual(request_data.get('account_id'), account.id)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
+  @mock_response(hp.POST, '/v2/accounts/foo/buys/bar/commit', mock_item)
+  def test_commit_buy(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    buy = account.commit_buy('bar')
+    self.assertIsInstance(buy, Buy)
+    self.assertEqual(buy, mock_item)
 
-    with self.assertRaises(APIError):
-     data = {'success': False, 'transfer': {'id': 'transferid'}}
-     account.buy('1.0')
+  @mock_response(hp.GET, '/v2/accounts/foo/sells', mock_collection)
+  def test_get_sells(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    sells = account.get_sells()
+    self.assertIsInstance(sells, APIObject)
+    self.assertEqual(sells.data, mock_collection)
+    for sell in sells.data:
+      self.assertIsInstance(sell, Sell)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'transfer': 'wrong-type'}
-     account.buy('1.0')
+  @mock_response(hp.GET, '/v2/accounts/foo/sells/bar', mock_item)
+  def test_get_sell(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    sell = account.get_sell('bar')
+    self.assertIsInstance(sell, Sell)
+    self.assertEqual(sell, mock_item)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'missing-transfer-key': True}
-     account.buy('1.0')
-
-    data = {'success': True, 'transfer': {'id': 'transferid'}}
-    transfer = account.buy('1.0')
-    self.assertIsInstance(transfer, Transfer)
-
-  @hp.activate
+  @mock_response(hp.POST, '/v2/accounts/foo/sells', mock_item)
   def test_sell(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    with self.assertRaises(ValueError):
+      account.sell()
+    for valid_kwargs in [{'amount': '1.0'}, {'total': '1.0'}]:
+      sell = account.sell(**valid_kwargs)
+      self.assertIsInstance(sell, Sell)
+      self.assertEqual(sell, mock_item)
 
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      self.assertEqual(request_data.get('account_id'), account.id)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
+  @mock_response(hp.POST, '/v2/accounts/foo/sells/bar/commit', mock_item)
+  def test_commit_sell(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    sell = account.commit_sell('bar')
+    self.assertIsInstance(sell, Sell)
+    self.assertEqual(sell, mock_item)
 
-    with self.assertRaises(APIError):
-     data = {'success': False, 'transfer': {'id': 'transferid'}}
-     account.sell('1.0')
+  @mock_response(hp.GET, '/v2/accounts/foo/deposits', mock_collection)
+  def test_get_deposits(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    deposits = account.get_deposits()
+    self.assertIsInstance(deposits, APIObject)
+    self.assertEqual(deposits.data, mock_collection)
+    for deposit in deposits.data:
+      self.assertIsInstance(deposit, Deposit)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'transfer': 'wrong-type'}
-     account.sell('1.0')
+  @mock_response(hp.GET, '/v2/accounts/foo/deposits/bar', mock_item)
+  def test_get_deposit(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    deposit = account.get_deposit('bar')
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
 
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'missing-transfer-key': True}
-     account.sell('1.0')
+  @mock_response(hp.POST, '/v2/accounts/foo/deposits', mock_item)
+  def test_deposit(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'payment_method': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        account.deposit(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    deposit = account.deposit(**send_kwargs)
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
 
-    data = {'success': True, 'transfer': {'id': 'transferid'}}
-    transfer = account.sell('1.0')
-    self.assertIsInstance(transfer, Transfer)
+  @mock_response(hp.POST, '/v2/accounts/foo/deposits/bar/commit', mock_item)
+  def test_commit_deposit(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    deposit = account.commit_deposit('bar')
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/withdrawals', mock_collection)
+  def test_get_withdrawals(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    withdrawals = account.get_withdrawals()
+    self.assertIsInstance(withdrawals, APIObject)
+    self.assertEqual(withdrawals.data, mock_collection)
+    for withdrawal in withdrawals.data:
+      self.assertIsInstance(withdrawal, Withdrawal)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/withdrawals/bar', mock_item)
+  def test_get_withdrawal(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    withdrawal = account.get_withdrawal('bar')
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/withdrawals', mock_item)
+  def test_withdraw(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'payment_method': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        account.withdraw(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    withdrawal = account.withdraw(**send_kwargs)
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/withdrawals/bar/commit', mock_item)
+  def test_commit_withdrawal(self):
+    client = Client(api_key, api_secret)
+    account = new_api_object(client, mock_account, Account)
+    withdrawal = account.commit_withdrawal('bar')
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
 
 
 
-class TestButton(unittest2.TestCase):
-  @hp.activate
+mock_checkout = {
+    'id': 'foo',
+    'resource_path': '/v2/checkouts/foo',
+  }
+class TestCheckout(unittest2.TestCase):
+  @mock_response(hp.GET, '/v2/checkouts/foo/orders', mock_collection)
   def test_get_orders(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    initial_name = 'name'
-    initial_price_string = '12.0'
-    initial_price_currency_iso = 'USD'
-
-    button = account.load({
-      'button': {
-        'id': '1',
-        'name': initial_name,
-        'price_string': initial_price_string,
-        'price_currency_iso': initial_price_currency_iso,
-        'code': 'buttoncode',
-      },
-    }).button
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-
-    data = {
-        'total_count': 3,
-        'current_page': 1,
-        'num_pages': 1,
-        'orders': [
-          {'order': {'id': '1'}},
-          {'order': {'id': '2'}},
-          {'order': {'id': '3'}},
-        ],
-      }
-    response = button.get_orders()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.orders), 3)
-    for order in response.orders:
+    client = Client(api_key, api_secret)
+    checkout = new_api_object(client, mock_checkout, Checkout)
+    orders = checkout.get_orders()
+    self.assertIsInstance(orders, APIObject)
+    self.assertEqual(orders.data, mock_collection)
+    for order in orders.data:
       self.assertIsInstance(order, Order)
 
-  @hp.activate
+  @mock_response(hp.POST, '/v2/checkouts/foo/orders', mock_item)
   def test_create_order(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    initial_name = 'name'
-    initial_price_string = '12.0'
-    initial_price_currency_iso = 'USD'
-
-    button = account.load({
-      'button': {
-        'id': '1',
-        'name': initial_name,
-        'price_string': initial_price_string,
-        'price_currency_iso': initial_price_currency_iso,
-        'code': 'buttoncode',
-      },
-    }).button
-
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    name = 'b-name'
-    price_string = 'b-price'
-    price_currency_iso = 'BTC'
-    with self.assertRaises(APIError):
-     data = {
-         'success': False,
-         'order': {
-           'name': name,
-           'price_string': price_string,
-           'price_currency_iso': price_currency_iso,
-
-         },
-       }
-     button.create_order()
-
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'order': 'wrong-type'}
-     button.create_order()
-
-    with self.assertRaises(UnexpectedDataFormatError):
-     data = {'success': True, 'missing-order-key': True}
-     button.create_order()
-
-    data = {
-        'success': True,
-        'order': {
-          'name': name,
-          'price_string': price_string,
-          'price_currency_iso': price_currency_iso,
-
-        },
-      }
-    order = button.create_order()
+    client = Client(api_key, api_secret)
+    checkout = new_api_object(client, mock_checkout, Checkout)
+    order = checkout.create_order()
     self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
 
 
-class TestMoney(unittest2.TestCase):
-  def test_str_representation(self):
-    money = APIObject(None).load({
-      'amount': '12.0',
-      'currency': 'BTC',
-    })
-    self.assertIsInstance(money, Money)
-    self.assertTrue(str(money).endswith('BTC 12.0'))
-
-    money2 = APIObject(None).load({
-      'amount': '12.0',
-      'currency': 'BTC',
-      'foo': 'Bar',
-    })
-    self.assertIsInstance(money2, Money)
-    self.assertTrue(str(money2).endswith('}'))
-
-
+mock_order = {
+    'id': 'foo',
+    'resource_path': '/v2/orders/foo',
+  }
 class TestOrder(unittest2.TestCase):
-  @hp.activate
+  @mock_response(hp.POST, '/v2/orders/foo/refund', mock_item)
   def test_refund(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    order = account.load({
-      'order': {
-        'id': '1',
-        'custom': 'custom',
-        'button': {
-          'id': 'fakeid',
-          'code': 'acode'
-        },
-      },
-    }).order
-    def server_response(request, uri, headers):
-      try: req_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      order_data = req_data.get('order')
-      self.assertIsInstance(order_data, dict)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'order': 'wrong-type'}
-      order.refund('USD')
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'missing-order-key': True}
-      order.refund('USD')
-
-    data = {'order': {'id': '1'}}
-    refunded = order.refund('USD')
-    self.assertEqual(refunded, data['order'])
-    self.assertIsInstance(refunded, Order)
+    client = Client(api_key, api_secret)
+    order = new_api_object(client, mock_order, Order)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        order.refund(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    order = order.refund(**send_kwargs)
+    self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
 
 
+mock_transaction = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/transactions/bar',
+  }
 class TestTransaction(unittest2.TestCase):
-  @hp.activate
-  def test_resend(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    transaction = account.load({'transaction': {'id': '1' }}).transaction
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.PUT, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      data = {'success': False}
-      transaction.resend()
-
-    data = {'success': True}
-    self.assertTrue(transaction.resend())
-
-  @hp.activate
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/complete', mock_item)
   def test_complete(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    transaction = account.load({'transaction': {'id': '1' }}).transaction
+    client = Client(api_key, api_secret)
+    transaction = new_api_object(client, mock_transaction, Transaction)
+    response = transaction.complete()
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
 
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.PUT, re.compile('.*'), body=server_response)
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/resend', mock_item)
+  def test_resend(self):
+    client = Client(api_key, api_secret)
+    transaction = new_api_object(client, mock_transaction, Transaction)
+    response = transaction.resend()
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
 
-    with self.assertRaises(APIError):
-      data = {'success': False, 'transaction': {'id': '1'}}
-      transaction.complete()
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'transaction': 'wrong-type'}
-      transaction.complete()
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'missing-transaction-key': True}
-      transaction.complete()
-
-    data = {'success': True, 'transaction': {'id': '1'}}
-    tx = transaction.complete()
-    self.assertIsInstance(tx, Transaction)
-
-  @hp.activate
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/cancel', mock_item)
   def test_cancel(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    transaction = account.load({'transaction': {'id': '1' }}).transaction
-
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.DELETE, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      data = {'success': False}
-      transaction.cancel()
-
-    data = {'success': True}
-    self.assertTrue(transaction.cancel())
+    client = Client(api_key, api_secret)
+    transaction = new_api_object(client, mock_transaction, Transaction)
+    response = transaction.cancel()
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
 
 
-class TestTransfer(unittest2.TestCase):
-  @hp.activate
+mock_buy = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/buys/bar',
+  }
+mock_buy_updated = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/buys/bar',
+    'updated': True,
+  }
+class TestBuy(unittest2.TestCase):
+  @mock_response(hp.POST, '/v2/accounts/foo/buys/bar/commit', mock_buy_updated)
   def test_commit(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    transfer = account.load({'transfer': {'id': '1' }}).transfer
+    client = Client(api_key, api_secret)
+    buy = new_api_object(client, mock_buy, Buy)
+    buy2 = buy.commit()
+    self.assertIsInstance(buy2, Buy)
+    self.assertEqual(buy2, mock_buy_updated)
+    for key, value in six.iteritems(mock_buy_updated):
+      self.assertEqual(buy[key], value)
 
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
 
-    with self.assertRaises(APIError):
-      data = {'success': False, 'transfer': {'id': '1'}}
-      transfer.commit()
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'transfer': 'wrong-type'}
-      transfer.commit()
-    with self.assertRaises(UnexpectedDataFormatError):
-      data = {'success': True, 'missing-transfer-key': True}
-      transfer.commit()
+mock_sell = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/sells/bar',
+  }
+mock_sell_updated = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/sells/bar',
+    'updated': True,
+  }
 
-    data = {'success': True, 'transfer': {'id': '1'}}
-    tx = transfer.commit()
-    self.assertIsInstance(tx, Transfer)
+class TestSell(unittest2.TestCase):
+  @mock_response(hp.POST, '/v2/accounts/foo/sells/bar/commit', mock_sell_updated)
+  def test_commit(self):
+    client = Client(api_key, api_secret)
+    sell = new_api_object(client, mock_sell, Sell)
+    sell2 = sell.commit()
+    self.assertIsInstance(sell2, Sell)
+    self.assertEqual(sell2, mock_sell_updated)
+    for key, value in six.iteritems(mock_sell_updated):
+      self.assertEqual(sell[key], value)
 
-class TestUser(unittest2.TestCase):
-  @hp.activate
+
+mock_deposit = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/deposits/bar',
+  }
+mock_deposit_updated = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/deposits/bar',
+    'updated': True,
+  }
+class TestDeposit(unittest2.TestCase):
+  @mock_response(hp.POST, '/v2/accounts/foo/deposits/bar/commit', mock_deposit_updated)
+  def test_commit(self):
+    client = Client(api_key, api_secret)
+    deposit = new_api_object(client, mock_deposit, Deposit)
+    deposit2 = deposit.commit()
+    self.assertIsInstance(deposit2, Deposit)
+    self.assertEqual(deposit2, mock_deposit_updated)
+    for key, value in six.iteritems(mock_deposit_updated):
+      self.assertEqual(deposit[key], value)
+
+
+mock_withdrawal = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/withdrawals/bar',
+  }
+mock_withdrawal_updated = {
+    'id': 'bar',
+    'resource_path': '/v2/accounts/foo/withdrawals/bar',
+    'updated': True,
+  }
+class TestWithdrawal(unittest2.TestCase):
+  @mock_response(hp.POST, '/v2/accounts/foo/withdrawals/bar/commit', mock_withdrawal_updated)
+  def test_commit(self):
+    client = Client(api_key, api_secret)
+    withdrawal = new_api_object(client, mock_withdrawal, Withdrawal)
+    withdrawal2 = withdrawal.commit()
+    self.assertIsInstance(withdrawal2, Withdrawal)
+    self.assertEqual(withdrawal2, mock_withdrawal_updated)
+    for key, value in six.iteritems(mock_withdrawal_updated):
+      self.assertEqual(withdrawal[key], value)
+    pass
+
+
+class TestCurrentUser(unittest2.TestCase):
+  @mock_response(hp.PUT, '/v2/user', mock_item_updated)
   def test_modify(self):
-    account = Account(Client(api_key, api_secret))
-    account.id = 'fakeaccountid'
-    initial_native_currency = 'USD',
-    initial_time_zone = 'Pacific Time (US & Canada)'
-    initial_name = 'Test User'
-    user = account.load({
-      'user': {
-        'id': '1',
-        'name': initial_name,
-        'native_currency': initial_native_currency,
-        'time_zone': initial_time_zone,
-      },
-    }).user
-
-    with self.assertRaises(ValueError):
-      user.modify()
-
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith(user.id))
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      user_data = request_data.get('user')
-      self.assertIsInstance(user_data, dict)
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.PUT, re.compile('.*'), body=server_response)
-
-    with self.assertRaises(APIError):
-      new_name = 'Fake Name'
-      data = {
-          'success': False,
-          'user': {
-            'id': user.id,
-            'name': new_name,
-            'native_currency': initial_native_currency,
-            'time_zone': initial_time_zone,
-          },
-        }
-      user.modify(name=new_name)
-    self.assertEqual(user.name, initial_name)
-    self.assertEqual(user.native_currency, initial_native_currency)
-    self.assertEqual(user.time_zone, initial_time_zone)
-
-    with self.assertRaises(UnexpectedDataFormatError):
-      new_name = 'Fake Name'
-      data = {'success': True, 'user': 'wrong-type'}
-      user.modify(name=new_name)
-    self.assertEqual(user.name, initial_name)
-    self.assertEqual(user.native_currency, initial_native_currency)
-    self.assertEqual(user.time_zone, initial_time_zone)
-
-    with self.assertRaises(UnexpectedDataFormatError):
-      new_name = 'Fake Name'
-      data = {'success': True, 'missing-user-key': True}
-      user.modify(name=new_name)
-    self.assertEqual(user.name, initial_name)
-    self.assertEqual(user.native_currency, initial_native_currency)
-    self.assertEqual(user.time_zone, initial_time_zone)
-
-    new_name = 'Fake Name'
-    new_native_currency = 'CAD'
-    new_time_zone = 'Eastern'
-    data = {
-        'success': True,
-        'user': {
-          'id': user.id,
-          'name': new_name,
-          'native_currency': new_native_currency,
-          'time_zone': new_time_zone,
-        },
-      }
-    user.modify(name=new_name,
-                time_zone=new_time_zone,
-                native_currency=new_native_currency)
-    self.assertEqual(user.name, new_name)
-    self.assertEqual(user.native_currency, new_native_currency)
-    self.assertEqual(user.time_zone, new_time_zone)
+    client = Client(api_key, api_secret)
+    user = new_api_object(client, mock_item, CurrentUser)
+    user2 = user.modify(name='New Name')
+    self.assertIsInstance(user2, CurrentUser)
+    self.assertEqual(user2, mock_item_updated)
+    for key, value in six.iteritems(mock_item_updated):
+      self.assertEqual(user[key], value)

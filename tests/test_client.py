@@ -16,20 +16,29 @@ except ImportError:
 
 import httpretty as hp
 
-from coinbase.client import Client
-from coinbase.client import OAuthClient
-from coinbase.error import APIError
-from coinbase.error import AuthenticationError
-from coinbase.error import TokenRefreshError
-from coinbase.error import TwoFactorTokenRequired
-from coinbase.error import ExpiredAccessToken
-from coinbase.error import InvalidAccessToken
-from coinbase.error import UnexpectedDataFormatError
-from coinbase.model import APIObject
-from coinbase.model import Account
-from coinbase.model import Money
-from coinbase.model import User
-from coinbase.model import PaymentMethod
+from coinbase.wallet.client import Client
+from coinbase.wallet.client import OAuthClient
+from coinbase.wallet.error import APIError
+from coinbase.wallet.error import AuthenticationError
+from coinbase.wallet.error import InvalidTokenError
+from coinbase.wallet.error import TwoFactorRequiredError
+from coinbase.wallet.error import ExpiredTokenError
+from coinbase.wallet.error import RevokedTokenError
+from coinbase.wallet.model import APIObject
+from coinbase.wallet.model import Account
+from coinbase.wallet.model import Merchant
+from coinbase.wallet.model import Checkout
+from coinbase.wallet.model import Address
+from coinbase.wallet.model import Order
+from coinbase.wallet.model import Buy
+from coinbase.wallet.model import CurrentUser
+from coinbase.wallet.model import Deposit
+from coinbase.wallet.model import PaymentMethod
+from coinbase.wallet.model import Sell
+from coinbase.wallet.model import Transaction
+from coinbase.wallet.model import User
+from coinbase.wallet.model import Withdrawal
+from tests.helpers import mock_response
 
 
 # Hide all warning output.
@@ -43,6 +52,9 @@ client_secret = 'fakesecret'
 access_token = 'fakeaccesstoken'
 refresh_token = 'fakerefreshtoken'
 
+mock_item = {'key1': 'val1', 'key2': 'val2'}
+mock_collection = [mock_item, mock_item]
+
 
 class TestClient(unittest2.TestCase):
   def test_key_and_secret_required(self):
@@ -51,29 +63,112 @@ class TestClient(unittest2.TestCase):
     with self.assertRaises(ValueError):
       Client(api_key, None)
 
-  @hp.activate
-  def test_response_handling(self):
-    resp200 = lambda r, u, h: (200, h, '')
-    resp400 = lambda r, u, h: (400, h, '')
-    resp401 = lambda r, u, h: (401, h, '')
-    hp.register_uri(hp.GET, re.compile('.*200$'), resp200)
-    hp.register_uri(hp.GET, re.compile('.*400$'), resp400)
-    hp.register_uri(hp.GET, re.compile('.*401$'), resp401)
+  @mock_response(hp.GET, 'test', {})
+  def test_auth_succeeds_with_bytes_and_unicode(self):
+    api_key = 'key'
+    api_secret = 'secret'
+    self.assertIsInstance(api_key, six.text_type) # Unicode
+    self.assertIsInstance(api_secret, six.text_type) # Unicode
 
     client = Client(api_key, api_secret)
+    self.assertEqual(client._get('test').status_code, 200)
 
-    assert client._get('200').status_code == 200
+    api_key = api_key.encode('utf-8')
+    api_secret = api_secret.encode('utf-8')
+    self.assertIsInstance(api_key, six.binary_type) # Bytes
+    self.assertIsInstance(api_secret, six.binary_type) # Bytes
 
+    client = Client(api_key, api_secret)
+    self.assertEqual(client._get('test').status_code, 200)
+
+  @hp.activate
+  def test_request_includes_auth_headers(self):
+    client = Client(api_key, api_secret)
+    def server_response(request, uri, response_headers):
+      keys = [
+          'CB-VERSION', 'CB-ACCESS-KEY', 'CB-ACCESS-SIGN',
+          'CB-ACCESS-TIMESTAMP', 'Accept', 'Content-Type', 'User-Agent']
+      for key in keys:
+        self.assertIn(key, request.headers)
+        self.assertNotEqual(request.headers[key], '')
+      return 200, response_headers, '{}'
+    hp.register_uri(hp.GET, re.compile('.*test$'), server_response)
+    self.assertEqual(client._get('test').status_code, 200)
+
+  @hp.activate
+  def test_response_handling(self):
+    client = Client(api_key, api_secret)
+    # Check that 2XX responses always return the response
+    error_response = {
+        'errors': [{
+          'id': 'fakeid',
+          'message': 'some error message',
+        }],
+        'data': mock_item,
+      }
+    error_str = json.dumps(error_response)
+    for code in [200, 201, 204]:
+      hp.register_uri(
+          hp.GET,
+          re.compile('.*' + str(code) + '$'),
+          lambda r, u, h: (code, h, error_str))
+      response = client._get(str(code))
+      self.assertEqual(response.status_code, code)
+
+    # Check that when the error data is in the response, that's what is used.
+    import coinbase.wallet.error
+    for eid, eclass in six.iteritems(
+        coinbase.wallet.error._error_id_to_class):
+      error_response = {
+        'errors': [{
+          'id': eid,
+          'message': 'some message',
+        }],
+        'data': mock_item,
+      }
+      error_str = json.dumps(error_response)
+      hp.reset()
+      hp.register_uri(
+          hp.GET,
+          re.compile('.*test$'),
+          lambda r, u, h: (400, h, error_str))
+      with self.assertRaises(eclass):
+        client._get('test')
+
+    # Check that when the error data is missing, the status code is used
+    # instead.
+    error_response = {'data': mock_item}
+    for code, eclass in six.iteritems(
+        coinbase.wallet.error._status_code_to_class):
+      hp.reset()
+      hp.register_uri(
+          hp.GET,
+          re.compile('.*test$'),
+          lambda r, u, h: (code, h, json.dumps(error_response)))
+      with self.assertRaises(eclass):
+        client._get('test')
+
+    # Check that when the response code / error id is unrecognized, a generic
+    # APIError is returned
+    hp.reset()
+    hp.register_uri(hp.GET, re.compile('.*test$'), lambda r, u, h: (418, h, '{}'))
     with self.assertRaises(APIError):
-      client._get('400')
-    with self.assertRaises(AuthenticationError):
-      client._get('401')
+      client._get('test')
+
+  @hp.activate
+  def test_request_helper_automatically_encodes_data(self):
+    client = Client(api_key, api_secret)
+    def server_response(request, uri, headers):
+      self.assertIsInstance(request.body, six.binary_type)
+      return 200, headers, '{}'
+    hp.register_uri(hp.POST, re.compile('.*foo$'), server_response)
+    self.assertEqual(client._post('foo', data={'name': 'example'}).status_code, 200)
 
   @hp.activate
   def test_base_api_uri_used_instead_of_default(self):
     # Requests to the default BASE_API_URI will noticeably fail by raising an
     # AssertionError. Requests to the new URL will respond HTTP 200.
-    new_base_api_uri = 'http://peterdowns.com/api/v1/'
+    new_base_api_uri = 'http://example.com/api/v1/'
 
     # If any error is raised by the server, the test suite will never exit when
     # using Python 3. This strange technique is used to raise the errors
@@ -98,519 +193,646 @@ class TestClient(unittest2.TestCase):
       client._get()
       if errors_in_server: raise errors_in_server.pop()
 
-  @hp.activate
-  def test_get_authorization(self):
-    data = {'meta': 'example', 'key': 'value'}
 
-    def server_response(request, uri, headers):
-      return (200, headers, json.dumps(data)) # Data coming from outer scope.
-
+  @mock_response(hp.GET, '/v2/currencies', mock_collection, warnings=[{'message':'foo','url':'bar'}])
+  def test_get_currencies(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(
-        hp.GET, re.compile('.*'), body=server_response)
-    authorization = client.get_authorization()
+    currencies = client.get_currencies()
+    self.assertIsInstance(currencies, APIObject)
+    self.assertEqual(currencies.data, mock_collection)
 
-    self.assertIsInstance(authorization, APIObject)
-    for key, value in authorization.items():
-      self.assertEqual(data.get(key), value)
-
-  @hp.activate
-  def test_get_account(self):
-    def make_server_response(account_id):
-      def server_response(request, uri, headers):
-        self.assertTrue(uri.endswith(account_id), (uri, account_id))
-        return (200, headers, json.dumps(data)) # Data coming from outer scope.
-      return server_response
-
-    # Check that client fetches primary account by default.
+  @mock_response(hp.GET, '/v2/exchange-rates', mock_collection)
+  def test_get_exchange_rates(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(
-        hp.GET, re.compile('.*'), body=make_server_response('primary'))
-    data = {'account': {'id': '54a710dd25dc9a311800003f'}}
-    account = client.get_account()
-    self.assertIsInstance(account, Account)
+    exchange_rates = client.get_exchange_rates()
+    self.assertIsInstance(exchange_rates, APIObject)
+    self.assertEqual(exchange_rates.data, mock_collection)
 
-    # Check that client fetches specific account ID.
-    hp.reset()
-    account_id = 'fakeid'
-    hp.register_uri(
-        hp.GET, re.compile('.*'), body=make_server_response(account_id))
-    account = client.get_account(account_id)
-    self.assertIsInstance(account, Account)
+  @mock_response(hp.GET, '/v2/prices/buy', mock_item)
+  def test_get_buy_price(self):
+    client = Client(api_key, api_secret)
+    buy_price = client.get_buy_price()
+    self.assertIsInstance(buy_price, APIObject)
+    self.assertEqual(buy_price, mock_item)
 
-    # Check that the client raises error on bad response format
-    data = {'notaccount': {'foo': 'bar'}}
-    with self.assertRaises(UnexpectedDataFormatError):
-      account = client.get_account(account_id)
+  @mock_response(hp.GET, '/v2/prices/sell', mock_item)
+  def test_get_sell_price(self):
+    client = Client(api_key, api_secret)
+    sell_price = client.get_sell_price()
+    self.assertIsInstance(sell_price, APIObject)
+    self.assertEqual(sell_price, mock_item)
 
-  @hp.activate
+  @mock_response(hp.GET, '/v2/prices/spot', mock_item)
+  def test_get_spot_price(self):
+    client = Client(api_key, api_secret)
+    spot_price = client.get_spot_price()
+    self.assertIsInstance(spot_price, APIObject)
+    self.assertEqual(spot_price, mock_item)
+
+  @mock_response(hp.GET, '/v2/time', mock_item)
+  def test_get_time(self):
+    client = Client(api_key, api_secret)
+    server_time = client.get_time()
+    self.assertIsInstance(server_time, APIObject)
+    self.assertEqual(server_time, mock_item)
+
+  @mock_response(hp.GET, '/v2/users/foo', mock_item)
+  def test_get_user(self):
+    client = Client(api_key, api_secret)
+    user = client.get_user('foo')
+    self.assertIsInstance(user, User)
+    self.assertEqual(user, mock_item)
+
+  @mock_response(hp.GET, '/v2/user', mock_item)
+  def test_get_current_user(self):
+    client = Client(api_key, api_secret)
+    user = client.get_current_user()
+    self.assertIsInstance(user, CurrentUser)
+    self.assertEqual(user, mock_item)
+
+  @mock_response(hp.GET, '/v2/user/auth', mock_item)
+  def test_get_auth_info(self):
+    client = Client(api_key, api_secret)
+    info = client.get_auth_info()
+    self.assertIsInstance(info, APIObject)
+    self.assertEqual(info, mock_item)
+
+  @mock_response(hp.PUT, '/v2/user', mock_item)
+  def test_update_current_user(self):
+    client = Client(api_key, api_secret)
+    user = client.update_current_user(name='New Name')
+    self.assertIsInstance(user, CurrentUser)
+    self.assertEqual(user, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts', mock_collection)
   def test_get_accounts(self):
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps({
-        'current_page': 1,
-        'num_pages': 1,
-        'total_count': 3,
-        'accounts': [{'id': '54a710dd25dc9a311800003f'},
-                     {'id': '54a710dd25dc9a311800003g'}],
-      }))
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
-    response = client.get_accounts()
-    self.assertIsInstance(response, APIObject)
-    self.assertEqual(len(response.accounts), 2)
-    for account in response.accounts:
+    accounts = client.get_accounts()
+    self.assertIsInstance(accounts, APIObject)
+    self.assertEqual(accounts.data, mock_collection)
+    for account in accounts.data:
       self.assertIsInstance(account, Account)
 
-  @hp.activate
-  def test_create_account(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      account = request_data.get('account')
-      assert isinstance(account, dict)
-      name = account.get('name')
-      assert isinstance(name, six.string_types)
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.GET, '/v2/accounts/foo', mock_item)
+  def test_get_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
-
-    data = {'account': {'id': 'fakeid'}, 'success': False}
-    with self.assertRaises(APIError):
-     client.create_account('accountname')
-
-    data = {'noaccountkey': True, 'success': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      client.create_account('accountname')
-
-    data = {'account': {'id': 'fakeid'}, 'success': True}
-    account = client.create_account('accountname')
+    account = client.get_account('foo')
     self.assertIsInstance(account, Account)
+    self.assertEqual(account, mock_item)
 
-  @hp.activate
-  def test_redeem_token(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      token_id = request_data.get('token_id')
-      assert isinstance(token_id, six.text_type)
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.GET, '/v2/accounts/primary', mock_item)
+  def test_get_primary_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
+    account = client.get_primary_account()
+    self.assertIsInstance(account, Account)
+    self.assertEqual(account, mock_item)
 
-    data = {'success': False}
-    assert False == client.redeem_token('token1')
-
-    data = {'success': True}
-    assert True == client.redeem_token('token2')
-
-
-  @hp.activate
-  def test_get_contacts(self):
-    def server_response(request, uri, headers):
-      try: json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.POST, '/v2/accounts', mock_item)
+  def test_create_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    account = client.create_account()
+    self.assertIsInstance(account, Account)
+    self.assertEqual(account, mock_item)
 
-    data = {
-        'contacts': [{'id': '1'}, {'id': '2'}],
-        'current_page': 1,
-        'num_pages': 1,
-        'total_count': 2,
-      }
-    contacts = client.get_contacts()
-    self.assertIsInstance(contacts, APIObject)
-    self.assertEqual(contacts, data)
-
-  @hp.activate
-  def test_get_current_user(self):
-    def server_response(request, uri, headers):
-      self.assertTrue(uri.endswith('users/self'))
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.POST, '/v2/accounts/foo/primary', mock_item)
+  def test_set_primary_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    account = client.set_primary_account('foo')
+    self.assertIsInstance(account, Account)
+    self.assertEqual(account, mock_item)
 
-    data = {'nouserkey': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      client.get_current_user()
-
-    data = {'user': {'id': 'fakeid'}}
-    user = client.get_current_user()
-    self.assertIsInstance(user, User)
-
-  @hp.activate
-  def test_get_buy_and_sell_price(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      self.assertEqual(request_data.get('qty'), quantity)
-      self.assertEqual(request_data.get('currency'), currency)
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.PUT, '/v2/accounts/foo', mock_item)
+  def test_update_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    account = client.update_account('foo', name='New Account Name')
+    self.assertIsInstance(account, Account)
+    self.assertEqual(account, mock_item)
 
-    for func in (client.get_buy_price, client.get_sell_price):
-      quantity, currency = (None, None)
-      data = {
-          'amount': '10.25',
-          'currency': 'USD',
-          'btc': {'amount': '1.0', 'currency': 'BTC'},
-        }
-      price = func()
-      self.assertIsInstance(price, Money)
-      self.assertEqual(price, data)
-
-      quantity, currency = (12, 'USD')
-      price = func(quantity, currency)
-      self.assertIsInstance(price, Money)
-      self.assertEqual(price, data)
-
-
-  @hp.activate
-  def test_get_spot_price(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      self.assertEqual(request_data.get('currency'), currency)
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.DELETE, '/v2/accounts/foo', None)
+  def test_delete_account(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    account = client.delete_account('foo')
+    self.assertIs(account, None)
 
-    currency = None
-    data = {'amount': '1.000', 'currency': 'BTC'}
-    price = client.get_spot_price()
-    self.assertIsInstance(price, Money)
-    self.assertEqual(price, data)
-
-    currency = 'USD'
-    data = {'amount': '10.00', 'currency': 'USD'}
-    price = client.get_spot_price(currency)
-    self.assertIsInstance(price, Money)
-    self.assertEqual(price, data)
-
-
-  @hp.activate
-  def test_get_supported_currencies(self):
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses', mock_collection)
+  def test_get_addresses(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    addresses = client.get_addresses('foo')
+    self.assertIsInstance(addresses, APIObject)
+    self.assertEqual(addresses.data, mock_collection)
+    for address in addresses.data:
+      self.assertIsInstance(address, Address)
 
-    data = [['Afghan Afghani (AFN)', 'AFN'],
-            ['United States Dollar (USD)', 'USD']]
-    currencies = client.get_supported_currencies()
-    self.assertIsInstance(currencies, list)
-    self.assertEqual(currencies, data)
-
-
-  @hp.activate
-  def test_get_exchange_rates(self):
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses/bar', mock_item)
+  def test_get_address(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    address = client.get_address('foo', 'bar')
+    self.assertIsInstance(address, Address)
+    self.assertEqual(address, mock_item)
 
-    data = {'aed_to_btc': '0.027224',
-            'btc_to_aed' : '36.73247'}
-    rates = client.get_exchange_rates()
-    self.assertIsInstance(rates, APIObject)
-    self.assertEqual(rates, data)
-
-  @hp.activate
-  def test_create_user(self):
-    def server_response(request, uri, headers):
-      try: request_data = json.loads(request.body.decode())
-      except ValueError: raise AssertionError("request body was malformed.")
-      if isinstance(scopes, (list, tuple)):
-        self.assertEqual(' '.join(scopes), request_data['user']['scopes'])
-      elif isinstance(scopes, six.string_types):
-        self.assertEqual(scopes, request_data['user']['scopes'])
-      self.assertIsInstance(request_data.get('user'), dict)
-      return (200, headers, json.dumps(data))
-
+  @mock_response(hp.GET, '/v2/accounts/foo/addresses/bar/transactions', mock_collection)
+  def test_get_address_transactions(self):
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.POST, re.compile('.*'), body=server_response)
+    transactions = client.get_address_transactions('foo', 'bar')
+    self.assertIsInstance(transactions, APIObject)
+    self.assertEqual(transactions.data, mock_collection)
+    for transaction in transactions.data:
+      self.assertIsInstance(transaction, Transaction)
 
-    scopes = None
-    data = {'success': False, 'errors': ['Email is not available']}
-    with self.assertRaises(APIError):
-      client.create_user('example@example.com', 'password')
+  @mock_response(hp.POST, '/v2/accounts/foo/addresses', mock_item)
+  def test_create_address(self):
+    client = Client(api_key, api_secret)
+    address = client.create_address('foo')
+    self.assertIsInstance(address, Address)
+    self.assertEqual(address, mock_item)
 
-    for scopes in (['a', 'b', 'c'], ('a', 'b', 'c'), 'a b c'):
-      data = {'success': True, 'user': {'id': 'fakeid'}}
-      client.create_user('example@example.com', 'password', scopes=scopes)
+  @mock_response(hp.GET, '/v2/accounts/foo/transactions', mock_collection)
+  def test_get_transactions(self):
+    client = Client(api_key, api_secret)
+    transactions = client.get_transactions('foo')
+    self.assertIsInstance(transactions, APIObject)
+    self.assertEqual(transactions.data, mock_collection)
+    for transaction in transactions.data:
+      self.assertIsInstance(transaction, Transaction)
 
-  @hp.activate
+  @mock_response(hp.GET, '/v2/accounts/foo/transactions/bar', mock_item)
+  def test_get_transaction(self):
+    client = Client(api_key, api_secret)
+    transaction = client.get_transaction('foo', 'bar')
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_send_money(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = client.send_money('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = client.send_money('foo', **send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_transfer_money(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = client.transfer_money('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = client.transfer_money('foo', **send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions', mock_item)
+  def test_request_money(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'to': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        transaction = client.request_money('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    transaction = client.request_money('foo', **send_kwargs)
+    self.assertIsInstance(transaction, Transaction)
+    self.assertEqual(transaction, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/complete', mock_item)
+  def test_complete_request(self):
+    client = Client(api_key, api_secret)
+    response = client.complete_request('foo', 'bar')
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/resend', mock_item)
+  def test_resend_request(self):
+    client = Client(api_key, api_secret)
+    response = client.resend_request('foo', 'bar')
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/transactions/bar/cancel', mock_item)
+  def test_cancel_request(self):
+    client = Client(api_key, api_secret)
+    response = client.cancel_request('foo', 'bar')
+    self.assertIsInstance(response, APIObject)
+    self.assertEqual(response, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/buys', mock_collection)
+  def test_get_buys(self):
+    client = Client(api_key, api_secret)
+    buys = client.get_buys('foo')
+    self.assertIsInstance(buys, APIObject)
+    self.assertEqual(buys.data, mock_collection)
+    for buy in buys.data:
+      self.assertIsInstance(buy, Buy)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/buys/bar', mock_item)
+  def test_get_buy(self):
+    client = Client(api_key, api_secret)
+    buy = client.get_buy('foo', 'bar')
+    self.assertIsInstance(buy, Buy)
+    self.assertEqual(buy, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/buys', mock_item)
+  def test_buy(self):
+    client = Client(api_key, api_secret)
+    with self.assertRaises(ValueError):
+      client.buy('foo')
+    for valid_kwargs in [{'amount': '1.0'}, {'total': '1.0'}]:
+      buy = client.buy('foo', **valid_kwargs)
+      self.assertIsInstance(buy, Buy)
+      self.assertEqual(buy, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/buys/bar/commit', mock_item)
+  def test_commit_buy(self):
+    client = Client(api_key, api_secret)
+    buy = client.commit_buy('foo', 'bar')
+    self.assertIsInstance(buy, Buy)
+    self.assertEqual(buy, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/sells', mock_collection)
+  def test_get_sells(self):
+    client = Client(api_key, api_secret)
+    sells = client.get_sells('foo')
+    self.assertIsInstance(sells, APIObject)
+    self.assertEqual(sells.data, mock_collection)
+    for sell in sells.data:
+      self.assertIsInstance(sell, Sell)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/sells/bar', mock_item)
+  def test_get_sell(self):
+    client = Client(api_key, api_secret)
+    sell = client.get_sell('foo', 'bar')
+    self.assertIsInstance(sell, Sell)
+    self.assertEqual(sell, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/sells', mock_item)
+  def test_sell(self):
+    client = Client(api_key, api_secret)
+    with self.assertRaises(ValueError):
+      client.sell('foo')
+    for valid_kwargs in [{'amount': '1.0'}, {'total': '1.0'}]:
+      sell = client.sell('foo', **valid_kwargs)
+      self.assertIsInstance(sell, Sell)
+      self.assertEqual(sell, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/sells/bar/commit', mock_item)
+  def test_commit_sell(self):
+    client = Client(api_key, api_secret)
+    sell = client.commit_sell('foo', 'bar')
+    self.assertIsInstance(sell, Sell)
+    self.assertEqual(sell, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/deposits', mock_collection)
+  def test_get_deposits(self):
+    client = Client(api_key, api_secret)
+    deposits = client.get_deposits('foo')
+    self.assertIsInstance(deposits, APIObject)
+    self.assertEqual(deposits.data, mock_collection)
+    for deposit in deposits.data:
+      self.assertIsInstance(deposit, Deposit)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/deposits/bar', mock_item)
+  def test_get_deposit(self):
+    client = Client(api_key, api_secret)
+    deposit = client.get_deposit('foo', 'bar')
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/deposits', mock_item)
+  def test_deposit(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'payment_method': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        client.deposit('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    deposit = client.deposit('foo', **send_kwargs)
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/deposits/bar/commit', mock_item)
+  def test_commit_deposit(self):
+    client = Client(api_key, api_secret)
+    deposit = client.commit_deposit('foo', 'bar')
+    self.assertIsInstance(deposit, Deposit)
+    self.assertEqual(deposit, mock_item)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/withdrawals', mock_collection)
+  def test_get_withdrawals(self):
+    client = Client(api_key, api_secret)
+    withdrawals = client.get_withdrawals('foo')
+    self.assertIsInstance(withdrawals, APIObject)
+    self.assertEqual(withdrawals.data, mock_collection)
+    for withdrawal in withdrawals.data:
+      self.assertIsInstance(withdrawal, Withdrawal)
+
+  @mock_response(hp.GET, '/v2/accounts/foo/withdrawals/bar', mock_item)
+  def test_get_withdrawal(self):
+    client = Client(api_key, api_secret)
+    withdrawal = client.get_withdrawal('foo', 'bar')
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/withdrawals', mock_item)
+  def test_withdraw(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'payment_method': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        client.withdraw('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    withdrawal = client.withdraw('foo', **send_kwargs)
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
+
+  @mock_response(hp.POST, '/v2/accounts/foo/withdrawals/bar/commit', mock_item)
+  def test_commit_withdrawal(self):
+    client = Client(api_key, api_secret)
+    withdrawal = client.commit_withdrawal('foo', 'bar')
+    self.assertIsInstance(withdrawal, Withdrawal)
+    self.assertEqual(withdrawal, mock_item)
+
+  @mock_response(hp.GET, '/v2/payment-methods', mock_collection)
   def test_get_payment_methods(self):
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    payment_methods = client.get_payment_methods()
+    self.assertIsInstance(payment_methods, APIObject)
+    self.assertEqual(payment_methods.data, mock_collection)
+    for payment_method in payment_methods.data:
+      self.assertIsInstance(payment_method, PaymentMethod)
 
-    data = {
-        'default_buy': '54a710de25dc9a311800006e',
-        'default_sell': '54a710de25dc9a311800006e',
-        'payment_methods': [{ 'payment_method': {'can_buy': True,
-                              'can_sell': True,
-                              'currency': 'USD',
-                              'id': '54a710de25dc9a311800006e',
-                              'name': 'Test Bank *****1111',
-                              'type': 'ach_bank_account'}}]}
-
-    methods = client.get_payment_methods()
-    self.assertIsInstance(methods, APIObject)
-    for method in methods.payment_methods:
-      self.assertIsInstance(method, PaymentMethod)
-    for method in methods[::]:
-      self.assertIsInstance(method, PaymentMethod)
-
-  @hp.activate
+  @mock_response(hp.GET, '/v2/payment-methods/foo', mock_item)
   def test_get_payment_method(self):
-    def server_response(request, uri, headers):
-      self.assertEqual(request.body.decode(), '')
-      return (200, headers, json.dumps(data))
-
     client = Client(api_key, api_secret)
-    hp.register_uri(hp.GET, re.compile('.*'), body=server_response)
+    payment_method = client.get_payment_method('foo')
+    self.assertIsInstance(payment_method, PaymentMethod)
+    self.assertEqual(payment_method, mock_item)
 
-    data = {"payment_method": {
-              "id": "530eb5b217cb34e07a000011",
-              "name": "US Bank ****4567",
-              "can_buy": True,
-              "can_sell": True}}
+  @mock_response(hp.GET, '/v2/merchants/foo', mock_item)
+  def test_get_merchant(self):
+    client = Client(api_key, api_secret)
+    merchant = client.get_merchant('foo')
+    self.assertIsInstance(merchant, Merchant)
+    self.assertEqual(merchant, mock_item)
 
-    method = client.get_payment_method('id')
-    self.assertIsInstance(method, PaymentMethod)
+  @mock_response(hp.GET, '/v2/orders', mock_collection)
+  def test_get_orders(self):
+    client = Client(api_key, api_secret)
+    orders = client.get_orders()
+    self.assertIsInstance(orders, APIObject)
+    self.assertEqual(orders.data, mock_collection)
+    for order in orders.data:
+      self.assertIsInstance(order, Order)
 
-    data = {'missing_payment_method_key': True}
-    with self.assertRaises(UnexpectedDataFormatError):
-      client.get_payment_method('id')
+  @mock_response(hp.GET, '/v2/orders/foo', mock_item)
+  def test_get_order(self):
+    client = Client(api_key, api_secret)
+    order = client.get_order('foo')
+    self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
 
-    data = {'payment_method': 'wrong-type'}
-    with self.assertRaises(UnexpectedDataFormatError):
-      client.get_payment_method('id')
+  @mock_response(hp.POST, '/v2/orders', mock_item)
+  def test_create_order(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'name': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        client.create_order(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    order = client.create_order(**send_kwargs)
+    self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
 
+  @mock_response(hp.POST, '/v2/orders/foo/refund', mock_item)
+  def test_refund_order(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        client.refund_order('foo', **send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    order = client.refund_order('foo', **send_kwargs)
+    self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
+
+  @mock_response(hp.GET, '/v2/checkouts', mock_collection)
+  def test_get_checkouts(self):
+    client = Client(api_key, api_secret)
+    checkouts = client.get_checkouts()
+    self.assertIsInstance(checkouts, APIObject)
+    self.assertEqual(checkouts.data, mock_collection)
+    for checkout in checkouts.data:
+      self.assertIsInstance(checkout, Checkout)
+
+  @mock_response(hp.GET, '/v2/checkouts/foo', mock_item)
+  def test_get_checkout(self):
+    client = Client(api_key, api_secret)
+    checkout = client.get_checkout('foo')
+    self.assertIsInstance(checkout, Checkout)
+    self.assertEqual(checkout, mock_item)
+
+  @mock_response(hp.POST, '/v2/checkouts', mock_item)
+  def test_create_checkout(self):
+    client = Client(api_key, api_secret)
+    # Start with none of the required arguments, and slowly make requests with
+    # an additional required argument, expecting failure until all arguments
+    # are present.
+    send_kwargs = {}
+    required_kwargs = {'name': 'bar', 'amount': '1.0', 'currency': 'USD'}
+    while required_kwargs:
+      with self.assertRaises(ValueError):
+        client.create_checkout(**send_kwargs)
+      for key in required_kwargs:
+        send_kwargs[key] = required_kwargs.pop(key)
+        break
+    checkout = client.create_checkout(**send_kwargs)
+    self.assertIsInstance(checkout, Checkout)
+    self.assertEqual(checkout, mock_item)
+
+  @mock_response(hp.GET, '/v2/checkouts/foo/orders', mock_collection)
+  def test_get_checkout_orders(self):
+    client = Client(api_key, api_secret)
+    orders = client.get_checkout_orders('foo')
+    self.assertIsInstance(orders, APIObject)
+    self.assertEqual(orders.data, mock_collection)
+    for order in orders.data:
+      self.assertIsInstance(order, Order)
+
+  @mock_response(hp.POST, '/v2/checkouts/foo/orders', mock_item)
+  def test_create_checkout_order(self):
+    client = Client(api_key, api_secret)
+    order = client.create_checkout_order('foo')
+    self.assertIsInstance(order, Order)
+    self.assertEqual(order, mock_item)
 
 class TestOauthClient(unittest2.TestCase):
-  @hp.activate
-  def test_auth_succeeds_with_bytes_and_unicode(self):
-    resp200 = lambda r, uh, h: (200, h, '')
-    hp.register_uri(hp.GET, re.compile('.*'), resp200)
-
-    api_key = 'key'
-    api_secret = 'secret'
-    self.assertIsInstance(api_key, six.text_type) # Unicode
-    self.assertIsInstance(api_secret, six.text_type) # Unicode
-
-    client = Client(api_key, api_secret)
-    self.assertEqual(client._get().status_code, 200)
-
-    api_key = api_key.encode('utf-8')
-    api_secret = api_secret.encode('utf-8')
-    self.assertIsInstance(api_key, six.binary_type) # Bytes
-    self.assertIsInstance(api_secret, six.binary_type) # Bytes
-
-    client = Client(api_key, api_secret)
-    self.assertEqual(client._get().status_code, 200)
+  def test_oauth_details_required(self):
+    with self.assertRaises(ValueError):
+      OAuthClient(None, refresh_token)
+    with self.assertRaises(ValueError):
+      OAuthClient(access_token, None)
+    client = OAuthClient(access_token, refresh_token)
 
   @hp.activate
-  def test_response_handling(self):
-    resp200 = lambda r, u, h: (200, h, '')
-    resp400 = lambda r, u, h: (400, h, '')
-    header_template = (
-        'Bearer realm="Doorkeeper" error="{id}" error_description="{error}"')
-    def resp401_expired(request, uri, headers):
-      error_data = {
-          'id': 'invalid_token',
-          'error': 'The access token expired',
-        }
-      headers.update({'www-authenticate': header_template.format(**error_data)})
-      return (401, headers, json.dumps(error_data))
-    def resp401_invalid(request, uri, headers):
-      error_data = {
-          'id': 'invalid_token',
-          'error': 'The access token is invalid',
-        }
-      headers.update({'www-authenticate': header_template.format(**error_data)})
-      return (401, headers, json.dumps(error_data))
-    def resp401_generic(request, uri, headers):
-      error_data = {
-          'id': 'some_error',
-          'error': 'Some description',
-        }
-      headers.update({'www-authenticate': header_template.format(**error_data)})
-      return (401, headers, json.dumps(error_data))
-    def resp401_nobody(request, uri, headers):
-      return (401, headers, '')
-    def resp401_header_expired(request, uri, headers):
-      code, headers, _ = resp401_expired(request, uri, headers)
-      return (code, headers, '')
-    def resp401_header_invalid(request, uri, headers):
-      code, headers, _ = resp401_invalid(request, uri, headers)
-      return (code, headers, '')
-    def resp401_header_generic(request, uri, headers):
-      code, headers, _ = resp401_generic(request, uri, headers)
-      return (code, headers, '')
-    resp402 = lambda r, u, h: (402, h, '')
-
-    hp.register_uri(hp.GET, re.compile('.*200$'), resp200)
-    hp.register_uri(hp.GET, re.compile('.*400$'), resp400)
-    hp.register_uri(hp.GET, re.compile('.*401_expired$'), resp401_expired)
-    hp.register_uri(hp.GET, re.compile('.*401_invalid$'), resp401_invalid)
-    hp.register_uri(hp.GET, re.compile('.*401_generic$'), resp401_generic)
-    hp.register_uri(hp.GET, re.compile('.*401_nobody$'), resp401_nobody)
-    hp.register_uri(hp.GET, re.compile('.*401_header_expired$'), resp401_header_expired)
-    hp.register_uri(hp.GET, re.compile('.*401_header_invalid$'), resp401_header_invalid)
-    hp.register_uri(hp.GET, re.compile('.*401_header_generic$'), resp401_header_generic)
-    hp.register_uri(hp.GET, re.compile('.*402$'), resp402)
-
-    client = OAuthClient(client_id, client_secret, access_token, refresh_token)
-    assert client._get('200').status_code == 200
-    with self.assertRaises(APIError):
-      client._get('400')
-    with self.assertRaises(AuthenticationError):
-      client._get('401_generic')
-    with self.assertRaises(AuthenticationError):
-      client._get('401_header_generic')
-    with self.assertRaises(InvalidAccessToken):
-      client._get('401_invalid')
-    with self.assertRaises(InvalidAccessToken):
-      client._get('401_header_invalid')
-    with self.assertRaises(ExpiredAccessToken):
-      client._get('401_expired')
-    with self.assertRaises(ExpiredAccessToken):
-      client._get('401_header_expired')
-    with self.assertRaises(AuthenticationError):
-      client._get('401_nobody')
-    with self.assertRaises(TwoFactorTokenRequired):
-      client._get('402')
-
-  @hp.activate
-  def test_base_api_uri_used_instead_of_default(self):
+  def test_refresh(self):
     # Requests to the default BASE_API_URI will noticeably fail by raising an
     # AssertionError. Requests to the new URL will respond HTTP 200.
-    new_base_api_uri = 'http://example.com/api/v1/'
-
-    # If any error is raised by the server, the test suite will never exit when
-    # using Python 3. This strange technique is used to raise the errors
-    # outside of the mocked server environment.
-    errors_in_server = []
-    def server_response(request, uri, headers):
-      try:
-        self.assertEqual(uri, new_base_api_uri)
-      except AssertionError as e:
-        errors_in_server.append(e)
-      return (200, headers, "")
-
-    hp.register_uri(hp.GET, OAuthClient.BASE_API_URI, body=server_response)
-    hp.register_uri(hp.GET, new_base_api_uri, body=server_response)
-
-    client = OAuthClient(client_id, client_secret, access_token, refresh_token)
-    with self.assertRaises(AssertionError):
-      client._get()
-      if errors_in_server: raise errors_in_server.pop()
-
-    client2 = OAuthClient(
-        client_id,
-        client_secret,
-        access_token,
-        refresh_token,
-        base_api_uri=new_base_api_uri)
-    self.assertEqual(client2._get().status_code, 200)
-
-  @hp.activate
-  def test_token_endpoint_uri_used_instead_of_default(self):
-    # Requests to the default BASE_API_URI will noticeably fail by raising an
-    # AssertionError. Requests to the new URL will respond HTTP 200.
-    new_token_endpoint_uri = 'http://example.com/oauth/token'
+    new_api_base = 'http://example.com/'
 
     # If any error is raised by the server, the test suite will never exit when
     # using Python 3. This strange technique is used to raise the errors
     # outside of the mocked server environment.
     errors_in_server = []
 
+    server_response_data = {
+        'access_token': 'newaccesstoken',
+        'refresh_token': 'newrefreshtoken',
+      }
     def server_response(request, uri, headers):
       parsed_uri = urlparse(uri)
-      parsed_reference = urlparse(new_token_endpoint_uri)
+      parsed_reference = urlparse(new_api_base)
       try:
         self.assertEqual(parsed_uri.scheme, parsed_reference.scheme)
         self.assertEqual(parsed_uri.netloc, parsed_reference.netloc)
         self.assertEqual(parsed_uri.path, parsed_reference.path)
       except AssertionError as e:
         errors_in_server.append(e)
-      response = {
-          'access_token': 'newaccesstoken',
-          'refresh_token': 'newrefreshtoken',
-        }
-      return (200, headers, json.dumps(response))
-    hp.register_uri(hp.POST, OAuthClient.TOKEN_ENDPOINT_URI, body=server_response)
-    hp.register_uri(hp.POST, new_token_endpoint_uri, body=server_response)
+      return (200, headers, json.dumps(server_response_data))
+    hp.register_uri(hp.POST, OAuthClient.BASE_API_URI + 'oauth/token', body=server_response)
+    hp.register_uri(hp.POST, new_api_base + 'oauth/token', body=server_response)
 
-    client = OAuthClient(client_id, client_secret, access_token, refresh_token)
+    client = OAuthClient(access_token, refresh_token)
     with self.assertRaises(AssertionError):
       client.refresh()
       if errors_in_server: raise errors_in_server.pop()
 
     client2 = OAuthClient(
-        client_id,
-        client_secret,
         access_token,
         refresh_token,
-        token_endpoint_uri=new_token_endpoint_uri)
-    self.assertTrue(client2.refresh())
+        base_api_uri=new_api_base)
+    self.assertEqual(client2.refresh(), server_response_data)
+
+    # If the response does not include both an access token and refresh token,
+    # an exception will be raised.
+    server_response_data = {'access_token': 'someaccesstoken'}
+    with self.assertRaises(APIError):
+      client2.refresh()
+    server_response_data = {'refresh_token': 'somerefreshtoken'}
+    with self.assertRaises(APIError):
+      client2.refresh()
+
+  @mock_response(hp.POST, '/oauth/revoke', mock_item)
+  def test_revoke(self):
+    client = OAuthClient(access_token, refresh_token)
+    response = client.revoke()
+    self.assertIs(response, None)
 
   @hp.activate
-  def test_refresh(self):
-    client = OAuthClient(client_id, client_secret, access_token, refresh_token)
+  def test_response_handling(self):
+    resp200 = lambda r, u, h: (200, h, '{}')
+    resp400 = lambda r, u, h: (400, h, '{}')
+    header_template = (
+        'Bearer realm="Doorkeeper" error="{error}" error_description="{message}"')
+    def resp401_revoked(request, uri, headers):
+      error_data = {
+          'error': 'revoked_token',
+          'message': 'The access token has been revoked',
+        }
+      headers.update({'www-authenticate': header_template.format(**error_data)})
+      return (401, headers, json.dumps(error_data))
+    def resp401_expired(request, uri, headers):
+      error_data = {
+          'error': 'expired_token',
+          'message': 'The access token expired',
+        }
+      headers.update({'www-authenticate': header_template.format(**error_data)})
+      return (401, headers, json.dumps(error_data))
+    def resp401_invalid(request, uri, headers):
+      error_data = {
+          'error': 'invalid_token',
+          'message': 'The access token is invalid',
+        }
+      headers.update({'www-authenticate': header_template.format(**error_data)})
+      return (401, headers, json.dumps(error_data))
+    def resp401_generic(request, uri, headers):
+      error_data = {
+          'error': 'some_error',
+          'message': 'Some description',
+        }
+      headers.update({'www-authenticate': header_template.format(**error_data)})
+      return (401, headers, json.dumps(error_data))
+    def resp401_nobody(request, uri, headers):
+      return (401, headers, '{}')
+    resp402 = lambda r, u, h: (402, h, '{}')
 
-    def server_response(request, uri, headers):
-      return (200, headers, json.dumps(data))
-    hp.register_uri(hp.POST, client.TOKEN_ENDPOINT_URI, body=server_response)
+    hp.register_uri(hp.GET, re.compile('.*200$'), resp200)
+    hp.register_uri(hp.GET, re.compile('.*400$'), resp400)
+    hp.register_uri(hp.GET, re.compile('.*401_expired$'), resp401_expired)
+    hp.register_uri(hp.GET, re.compile('.*401_revoked$'), resp401_revoked)
+    hp.register_uri(hp.GET, re.compile('.*401_invalid$'), resp401_invalid)
+    hp.register_uri(hp.GET, re.compile('.*401_generic$'), resp401_generic)
+    hp.register_uri(hp.GET, re.compile('.*401_nobody$'), resp401_nobody)
+    hp.register_uri(hp.GET, re.compile('.*402$'), resp402)
 
-    data = {
-        'access_token': 'newaccesstoken',
-        'refresh_token': 'newrefreshtoken',
-      }
-    self.assertNotEqual(client.access_token, data['access_token'])
-    self.assertNotEqual(client.refresh_token, data['refresh_token'])
-    client.refresh()
-    self.assertEqual(client.access_token, data['access_token'])
-    self.assertEqual(client.refresh_token, data['refresh_token'])
+    client = OAuthClient(access_token, refresh_token)
+    self.assertEqual(client._get('200').status_code, 200)
+    with self.assertRaises(APIError):
+      client._get('400')
+    with self.assertRaises(AuthenticationError):
+      client._get('401_generic')
+    with self.assertRaises(InvalidTokenError):
+      client._get('401_invalid')
+    with self.assertRaises(ExpiredTokenError):
+      client._get('401_expired')
+    with self.assertRaises(RevokedTokenError):
+      client._get('401_revoked')
+    with self.assertRaises(AuthenticationError):
+      client._get('401_nobody')
+    with self.assertRaises(TwoFactorRequiredError):
+      client._get('402')
 
-    def server_response(request, uri, headers):
-      return (400, headers, '')
-    hp.reset()
-    hp.register_uri(hp.POST, client.TOKEN_ENDPOINT_URI, body=server_response)
-
-    client.access_token = access_token
-    client.refresh_token = refresh_token
-    with self.assertRaises(TokenRefreshError):
-      client.refresh()
-    self.assertEqual(client.access_token, access_token)
-    self.assertEqual(client.refresh_token, refresh_token)
-
-  def test_oauth_details_required(self):
-    with self.assertRaises(ValueError):
-      OAuthClient(None, client_secret, access_token, refresh_token)
-    with self.assertRaises(ValueError):
-      OAuthClient(client_id, None, access_token, refresh_token)
-    with self.assertRaises(ValueError):
-      OAuthClient(client_id, client_secret, None, refresh_token)
-    with self.assertRaises(ValueError):
-      OAuthClient(client_id, client_secret, access_token, None)

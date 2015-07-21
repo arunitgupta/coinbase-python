@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 
 import unittest2
 
-from coinbase.util import _clean_params
+from coinbase.wallet.util import clean_params
 
 class TestUtils(unittest2.TestCase):
   def test_clean_params(self):
@@ -23,7 +23,7 @@ class TestUtils(unittest2.TestCase):
         },
       }
 
-    self.assertEqual(_clean_params(input), {
+    self.assertEqual(clean_params(input), {
       'int': 1,
       'float': 2.0,
       'bool': True,
@@ -33,17 +33,7 @@ class TestUtils(unittest2.TestCase):
         'bool': False,
       },
     })
-    self.assertEqual(_clean_params(input, bools_to_ints=True), {
-      'int': 1,
-      'float': 2.0,
-      'bool': 1,
-      'nested': {
-        'int': 1,
-        'float': 2.0,
-        'bool': 0,
-      },
-    })
-    self.assertEqual(_clean_params(input, drop_nones=False), {
+    self.assertEqual(clean_params(input, drop_nones=False), {
       'none': None,
       'int': 1,
       'float': 2.0,
@@ -55,7 +45,7 @@ class TestUtils(unittest2.TestCase):
         'bool': 0,
       },
     })
-    self.assertEqual(_clean_params(input, recursive=False), {
+    self.assertEqual(clean_params(input, recursive=False), {
       'int': 1,
       'float': 2.0,
       'bool': 1,

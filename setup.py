@@ -1,7 +1,7 @@
 # coding: utf-8
 import os
 from setuptools import setup
-import coinbase
+import coinbase.wallet
 
 README = open(os.path.join(os.path.dirname(__file__), 'PYPIREADME.rst')).read()
 REQUIREMENTS = [
@@ -10,15 +10,15 @@ REQUIREMENTS = [
 
 setup(
     name='coinbase',
-    version=coinbase.__version__,
-    packages=['coinbase'],
+    version=coinbase.wallet.__version__,
+    packages=['coinbase', 'coinbase.wallet'],
     include_package_data=True,
     license='MIT License',
     description='Coinbase API client library',
     long_description=README,
     url='https://github.com/coinbase/coinbase-python/',
     download_url='https://github.com/coinbase/coinbase-python/tarball/%s' % (
-      coinbase.__version__),
+      coinbase.wallet.__version__),
     keywords=['api', 'coinbase', 'bitcoin', 'oauth2', 'client'],
     install_requires=REQUIREMENTS,
     author='Coinbase, Inc.',
